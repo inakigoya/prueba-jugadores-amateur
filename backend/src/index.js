@@ -5,6 +5,14 @@ const fs = require('fs')
 const { v4: uuidv4 } = require('uuid')
 const multer = require('multer')
 
+// Automatización Gesdeportiva (se carga solo si Playwright está instalado)
+let cargarJugadorEnGesdeportiva = null
+try {
+  cargarJugadorEnGesdeportiva = require('./gesdeportiva').cargarJugadorEnGesdeportiva
+} catch {
+  console.log('Playwright no disponible — integración Gesdeportiva desactivada')
+}
+
 const app = express()
 const PORT = process.env.PORT || 3001
 
@@ -139,18 +147,40 @@ app.post('/api/solicitudes', (req, res) => {
   })
 })
 
-app.patch('/api/solicitudes/:id', (req, res) => {
+app.patch('/api/solicitudes/:id', async (req, res) => {
   const { estado, motivo_rechazo } = req.body
   if (!['aprobado', 'rechazado'].includes(estado)) {
     return res.status(400).json({ error: 'Estado inválido' })
   }
   const sol = db.solicitudes.find(s => s.id === req.params.id)
   if (!sol) return res.status(404).json({ error: 'No encontrado' })
+
   sol.estado = estado
   sol.motivo_rechazo = motivo_rechazo || null
   sol.updated_at = new Date().toISOString()
+  sol.gesdeportiva_ok = null
+  sol.gesdeportiva_error = null
   saveDb(db)
+
+  // Responder inmediatamente para no bloquear el panel
   res.json({ ok: true })
+
+  // Si fue aprobado, cargar en Gesdeportiva en segundo plano
+  if (estado === 'aprobado' && cargarJugadorEnGesdeportiva) {
+    console.log(`Iniciando carga en Gesdeportiva para ${sol.nombre} ${sol.apellido}...`)
+    cargarJugadorEnGesdeportiva(sol)
+      .then(result => {
+        sol.gesdeportiva_ok = result.ok
+        sol.gesdeportiva_error = result.error || null
+        saveDb(db)
+        console.log(`Gesdeportiva resultado para ${sol.nombre}: ${result.ok ? '✓ OK' : '✗ ' + result.error}`)
+      })
+      .catch(err => {
+        sol.gesdeportiva_ok = false
+        sol.gesdeportiva_error = err.message
+        saveDb(db)
+      })
+  }
 })
 
 app.get('/api/stats', (req, res) => {

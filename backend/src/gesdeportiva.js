@@ -1,188 +1,275 @@
-const { chromium } = require('playwright')
-const path = require('path')
-
-const BASE_URL = 'https://gesdeportiva.cabb.com.ar/clubes'
-const LOGIN_URL = `${BASE_URL}/index.aspx`
-const COMPONENTES_URL = `${BASE_URL}/es/inscripciones/componentes/index.aspx`
-const NUEVO_URL = `${BASE_URL}/es/inscripciones/componentes/nuevo.aspx`
-
-const USUARIO = process.env.GESDEPORTIVA_USER || '39720293'
-const CLAVE = process.env.GESDEPORTIVA_PASS || 'Boca1905'
-const UPLOADS_DIR = path.join(__dirname, '..', 'uploads')
-
 /**
- * Carga un jugador en Gesdeportiva dado el objeto solicitud de la base de datos.
- * @param {object} solicitud - registro de la BD
- * @returns {{ ok: boolean, error?: string }}
+ * Integración con Gesdeportiva via HTTP directo (sin Playwright).
+ * Simula el login y el envío del formulario de nuevo componente.
  */
+
+const https = require('https')
+const http = require('http')
+const fs = require('fs')
+const path = require('path')
+const { URLSearchParams } = require('url')
+
+const BASE = 'https://gesdeportiva.cabb.com.ar/clubes'
+const USUARIO = process.env.GESDEPORTIVA_USER || '39720293'
+const CLAVE   = process.env.GESDEPORTIVA_PASS  || 'Boca1905'
+const UPLOADS_DIR = path.join(__dirname, '..', 'uploads')
+const TIMEOUT_MS = 30000
+
+// ── Utilidades HTTP ───────────────────────────────────────────────────────────
+
+function request(options, body = null) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Timeout de red')), TIMEOUT_MS)
+    const mod = options.protocol === 'http:' ? http : https
+    const req = mod.request(options, res => {
+      const chunks = []
+      res.on('data', c => chunks.push(c))
+      res.on('end', () => {
+        clearTimeout(timer)
+        resolve({
+          status: res.statusCode,
+          headers: res.headers,
+          body: Buffer.concat(chunks).toString('utf8'),
+        })
+      })
+    })
+    req.on('error', e => { clearTimeout(timer); reject(e) })
+    if (body) req.write(body)
+    req.end()
+  })
+}
+
+function parseCookies(setCookieHeaders) {
+  if (!setCookieHeaders) return {}
+  const arr = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders]
+  const cookies = {}
+  arr.forEach(h => {
+    const part = h.split(';')[0]
+    const [k, v] = part.split('=')
+    if (k) cookies[k.trim()] = (v || '').trim()
+  })
+  return cookies
+}
+
+function cookieString(cookies) {
+  return Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join('; ')
+}
+
+function extractViewState(html) {
+  const match = html.match(/id="__VIEWSTATE"\s+value="([^"]*)"/)
+  return match ? match[1] : ''
+}
+
+function extractEventValidation(html) {
+  const match = html.match(/id="__EVENTVALIDATION"\s+value="([^"]*)"/)
+  return match ? match[1] : ''
+}
+
+function extractViewStateGenerator(html) {
+  const match = html.match(/id="__VIEWSTATEGENERATOR"\s+value="([^"]*)"/)
+  return match ? match[1] : ''
+}
+
+function urlOf(p) {
+  const u = new URL(BASE + p)
+  return { hostname: u.hostname, path: u.pathname + u.search, protocol: u.protocol }
+}
+
+// ── Login ─────────────────────────────────────────────────────────────────────
+
+async function login() {
+  const loginPath = '/index.aspx'
+  const base = urlOf(loginPath)
+
+  // GET login para obtener ViewState
+  const get = await request({
+    hostname: base.hostname,
+    path: base.path,
+    method: 'GET',
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    protocol: base.protocol,
+  })
+
+  let cookies = parseCookies(get.headers['set-cookie'])
+  const vs = extractViewState(get.body)
+  const evv = extractEventValidation(get.body)
+  const vsg = extractViewStateGenerator(get.body)
+
+  // Extraer nombres de campos del form
+  const usuarioMatch = get.body.match(/name="([^"]*[Uu]suario[^"]*)"/)
+  const claveMatch   = get.body.match(/name="([^"]*[Cc]lave[^"]*|[^"]*[Pp]ass[^"]*)"/)
+  const tipoMatch    = get.body.match(/name="([^"]*[Tt]ipo[^"]*)"/)
+  const btnMatch     = get.body.match(/name="([^"]*[Bb]tn[^"]*|[^"]*[Ss]ubmit[^"]*)"[^>]*type="submit"/i)
+
+  const usuarioField = usuarioMatch ? usuarioMatch[1] : 'ctl00$ContentPlaceHolder1$txtUsuario'
+  const claveField   = claveMatch   ? claveMatch[1]   : 'ctl00$ContentPlaceHolder1$txtClave'
+  const tipoField    = tipoMatch    ? tipoMatch[1]    : 'ctl00$ContentPlaceHolder1$ddlTipo'
+  const btnField     = btnMatch     ? btnMatch[1]     : 'ctl00$ContentPlaceHolder1$btnIngresar'
+
+  const params = new URLSearchParams({
+    '__VIEWSTATE': vs,
+    '__VIEWSTATEGENERATOR': vsg,
+    '__EVENTVALIDATION': evv,
+    [usuarioField]: USUARIO,
+    [claveField]: CLAVE,
+    [tipoField]: '3', // Operador Gesdeportiva = valor 3 típicamente
+    [btnField]: 'Ingresar',
+  })
+
+  const body = params.toString()
+
+  const post = await request({
+    hostname: base.hostname,
+    path: base.path,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Length': Buffer.byteLength(body),
+      'Cookie': cookieString(cookies),
+      'User-Agent': 'Mozilla/5.0',
+      'Referer': BASE + loginPath,
+    },
+    protocol: base.protocol,
+  }, body)
+
+  // Seguir redirect si lo hay
+  const newCookies = parseCookies(post.headers['set-cookie'])
+  cookies = { ...cookies, ...newCookies }
+
+  if (post.status === 302 || post.status === 301) {
+    const loc = post.headers['location']
+    if (loc && !loc.includes('index.aspx')) {
+      return { ok: true, cookies }
+    }
+  }
+
+  // Verificar que no volvimos al login
+  if (post.body.includes('txtClave') || post.body.includes('txtUsuario')) {
+    throw new Error('Login fallido: credenciales incorrectas o campo de login no encontrado')
+  }
+
+  return { ok: true, cookies }
+}
+
+// ── Cargar jugador ────────────────────────────────────────────────────────────
+
 async function cargarJugadorEnGesdeportiva(solicitud) {
-  const browser = await chromium.launch({ headless: true })
-  const page = await browser.newPage()
-
   try {
-    // ── 1. LOGIN ────────────────────────────────────────────────────────────────
-    await page.goto(LOGIN_URL, { waitUntil: 'networkidle' })
+    console.log(`[GD] Iniciando login para ${solicitud.nombre} ${solicitud.apellido}`)
 
-    await page.fill('input[name*="usuario"], input[name*="Usuario"], input[type="text"]', USUARIO)
-    await page.fill('input[name*="clave"], input[name*="Clave"], input[type="password"]', CLAVE)
+    const { cookies } = await login()
+    console.log('[GD] Login OK, obteniendo formulario...')
 
-    // Seleccionar tipo "Operador Gesdeportiva"
-    await page.selectOption(
-      'select[name*="tipo"], select[name*="Tipo"]',
-      { label: 'Operador Gesdeportiva' }
-    )
+    const nuevoPath = '/es/inscripciones/componentes/nuevo.aspx'
+    const base = urlOf(nuevoPath)
 
-    await page.click('input[type="submit"], button[type="submit"]')
-    await page.waitForURL(`**\/es\/**`, { timeout: 15000 })
+    // GET formulario nuevo componente
+    const getForm = await request({
+      hostname: base.hostname,
+      path: base.path,
+      method: 'GET',
+      headers: {
+        'Cookie': cookieString(cookies),
+        'User-Agent': 'Mozilla/5.0',
+      },
+      protocol: base.protocol,
+    })
 
-    // ── 2. NAVEGAR AL FORMULARIO NUEVO COMPONENTE ───────────────────────────────
-    await page.goto(NUEVO_URL, { waitUntil: 'networkidle' })
-
-    // ── 3. TIPO DE COMPONENTE ───────────────────────────────────────────────────
-    // Seleccionar JUGADOR/A
-    await page.selectOption(
-      'select[id*="TipoComponente"], select[id*="tipocomponente"]',
-      { label: 'JUGADOR/A' }
-    ).catch(() => {}) // Si ya viene seleccionado, ignorar
-
-    // Asegurar que Activo esté marcado
-    const activoCheck = page.locator('input[id*="Activo"], input[id*="activo"]').first()
-    if (!(await activoCheck.isChecked().catch(() => false))) {
-      await activoCheck.check().catch(() => {})
+    if (getForm.status === 302 || getForm.body.includes('index.aspx')) {
+      throw new Error('Sesión no iniciada correctamente — redirigido al login')
     }
 
-    // ── 4. DATOS PERSONALES ─────────────────────────────────────────────────────
-    await page.fill('input[id*="Nombre"][id*="comp"], input[name*="Nombre"]', solicitud.nombre || '')
-    await page.fill('input[id*="Apellido"], input[name*="Apellido"]', solicitud.apellido || '')
+    console.log('[GD] Formulario obtenido, preparando datos...')
 
-    // Sexo
-    const sexoVal = solicitud.sexo === 'Mujer' ? 'Mujer' : 'Hombre'
-    await page.selectOption(
-      'select[id*="Sexo"], select[name*="Sexo"]',
-      { label: sexoVal }
-    ).catch(() => {})
+    const vs2  = extractViewState(getForm.body)
+    const evv2 = extractEventValidation(getForm.body)
+    const vsg2 = extractViewStateGenerator(getForm.body)
 
-    // Fecha de nacimiento (formato DD/MM/YYYY)
-    if (solicitud.fecha_nac) {
-      const [yyyy, mm, dd] = solicitud.fecha_nac.split('-')
-      const fechaFormateada = `${dd}/${mm}/${yyyy}`
-      await page.fill(
-        'input[id*="FechaNac"], input[name*="FechaNac"], input[id*="fechanac"]',
-        fechaFormateada
-      )
+    const newCookies = parseCookies(getForm.headers['set-cookie'])
+    const sessionCookies = { ...cookies, ...newCookies }
+
+    // Formato fecha DD/MM/YYYY
+    function toDisplayDate(isoDate) {
+      if (!isoDate) return ''
+      const [y, m, d] = isoDate.split('-')
+      return `${d}/${m}/${y}`
     }
 
-    // Foto del niño/a
-    if (solicitud.archivo_foto) {
-      const fotoPath = path.join(UPLOADS_DIR, solicitud.archivo_foto)
-      await page.locator('input[type="file"][id*="foto"], input[type="file"][id*="Foto"]')
-        .first()
-        .setInputFiles(fotoPath)
-        .catch(() => {})
+    // Construir campos del formulario
+    // Los IDs reales de ASP.NET suelen tener prefijo ctl00$ContentPlaceHolder1$
+    const P = 'ctl00$ContentPlaceHolder1$'
+    const formData = new URLSearchParams({
+      '__VIEWSTATE': vs2,
+      '__VIEWSTATEGENERATOR': vsg2,
+      '__EVENTVALIDATION': evv2,
+      // Tipo y estado
+      [`${P}ddlTipoComponente`]: 'JUG',   // valor para JUGADOR/A
+      [`${P}chkActivo`]: 'on',
+      // Datos personales
+      [`${P}txtNombre`]: solicitud.nombre || '',
+      [`${P}txtApellidos`]: solicitud.apellido || '',
+      [`${P}ddlSexo`]: solicitud.sexo === 'Mujer' ? 'F' : 'M',
+      [`${P}txtFechaNacimiento`]: toDisplayDate(solicitud.fecha_nac),
+      [`${P}ddlNacionalidad`]: 'ARG',
+      // Documento niño/a
+      [`${P}ddlTipoDocumento`]: 'DNI',
+      [`${P}txtDocumento`]: solicitud.numero_doc || '',
+      [`${P}txtFechaCaducidad`]: toDisplayDate(solicitud.vencimiento_doc),
+      [`${P}ddlPaisNacimiento`]: 'ARG',
+      [`${P}ddlProvinciaNacimiento`]: '1', // CABA
+      // Tutor
+      [`${P}txtNombreTutor`]: solicitud.tutor_nombre || '',
+      [`${P}txtApellidosTutor`]: solicitud.tutor_apellido || '',
+      [`${P}txtDocumentoTutor`]: solicitud.tutor_doc || '',
+      [`${P}txtFechaCaducidadTutor`]: toDisplayDate(solicitud.tutor_venc_doc),
+      // Otras flags
+      [`${P}chkNoExtranjero`]: 'on',
+      [`${P}chkJugador`]: 'on',
+      // Botón submit
+      [`${P}btnInsertar`]: 'Insertar componente',
+    })
+
+    const formBody = formData.toString()
+
+    console.log('[GD] Enviando formulario...')
+
+    const postForm = await request({
+      hostname: base.hostname,
+      path: base.path,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(formBody),
+        'Cookie': cookieString(sessionCookies),
+        'User-Agent': 'Mozilla/5.0',
+        'Referer': BASE + nuevoPath,
+      },
+      protocol: base.protocol,
+    }, formBody)
+
+    console.log(`[GD] Respuesta del servidor: HTTP ${postForm.status}`)
+
+    // Verificar resultado
+    const responseBody = postForm.body.toLowerCase()
+    if (
+      postForm.status === 302 ||
+      responseBody.includes('componente insertado') ||
+      responseBody.includes('guardado') ||
+      responseBody.includes('correcto') ||
+      (postForm.status === 200 && !responseBody.includes('error') && !responseBody.includes('incorrecto'))
+    ) {
+      console.log(`[GD] ✓ Jugador ${solicitud.nombre} ${solicitud.apellido} insertado correctamente`)
+      return { ok: true }
     }
 
-    // ── 5. DOCUMENTO DEL NIÑO/A ─────────────────────────────────────────────────
-    // Tipo de documento: DNI (ya viene por defecto)
-    await page.fill(
-      'input[id*="NumDoc"], input[id*="numdoc"], input[id*="Documento"]:not([id*="tutor"]):not([id*="Tutor"])',
-      solicitud.numero_doc || ''
-    )
-
-    // Fecha caducidad
-    if (solicitud.vencimiento_doc) {
-      const [yyyy, mm, dd] = solicitud.vencimiento_doc.split('-')
-      const fechaFormateada = `${dd}/${mm}/${yyyy}`
-      await page.fill(
-        'input[id*="FechaCad"], input[id*="fechacad"], input[id*="Caducidad"]:not([id*="tutor"]):not([id*="Tutor"])',
-        fechaFormateada
-      ).catch(() => {})
-    }
-
-    // DNI delante del niño/a
-    if (solicitud.archivo_dni_frente) {
-      const frentePath = path.join(UPLOADS_DIR, solicitud.archivo_dni_frente)
-      const fileInputs = page.locator('input[type="file"]')
-      const count = await fileInputs.count()
-      // El segundo input de archivo suele ser DNI delante
-      if (count > 1) {
-        await fileInputs.nth(1).setInputFiles(frentePath).catch(() => {})
-      }
-    }
-
-    // DNI detrás del niño/a
-    if (solicitud.archivo_dni_dorso) {
-      const dorsoPath = path.join(UPLOADS_DIR, solicitud.archivo_dni_dorso)
-      const fileInputs = page.locator('input[type="file"]')
-      const count = await fileInputs.count()
-      if (count > 2) {
-        await fileInputs.nth(2).setInputFiles(dorsoPath).catch(() => {})
-      }
-    }
-
-    // ── 6. DATOS DEL TUTOR (sección "Sólo para menores de edad") ───────────────
-    await page.fill(
-      'input[id*="NombreTutor"], input[id*="nombretutor"], input[name*="NombreTutor"]',
-      solicitud.tutor_nombre || ''
-    ).catch(() => {})
-
-    await page.fill(
-      'input[id*="ApellidoTutor"], input[id*="apellidotutor"], input[name*="ApellidoTutor"]',
-      solicitud.tutor_apellido || ''
-    ).catch(() => {})
-
-    await page.fill(
-      'input[id*="DocTutor"], input[id*="doctutor"], input[id*="DocumentoTutor"]',
-      solicitud.tutor_doc || ''
-    ).catch(() => {})
-
-    // Fecha caducidad tutor
-    if (solicitud.tutor_venc_doc) {
-      const [yyyy, mm, dd] = solicitud.tutor_venc_doc.split('-')
-      const fechaFormateada = `${dd}/${mm}/${yyyy}`
-      await page.fill(
-        'input[id*="FechaCadTutor"], input[id*="fechacadtutor"], input[id*="CaducidadTutor"]',
-        fechaFormateada
-      ).catch(() => {})
-    }
-
-    // DNI tutor delante
-    if (solicitud.archivo_tutor_frente) {
-      const frenteTutorPath = path.join(UPLOADS_DIR, solicitud.archivo_tutor_frente)
-      const fileInputs = page.locator('input[type="file"]')
-      const count = await fileInputs.count()
-      if (count > 3) {
-        await fileInputs.nth(3).setInputFiles(frenteTutorPath).catch(() => {})
-      }
-    }
-
-    // DNI tutor detrás
-    if (solicitud.archivo_tutor_dorso) {
-      const dorsoTutorPath = path.join(UPLOADS_DIR, solicitud.archivo_tutor_dorso)
-      const fileInputs = page.locator('input[type="file"]')
-      const count = await fileInputs.count()
-      if (count > 4) {
-        await fileInputs.nth(4).setInputFiles(dorsoTutorPath).catch(() => {})
-      }
-    }
-
-    // ── 7. INSERTAR COMPONENTE ──────────────────────────────────────────────────
-    await page.click('input[value*="Insertar"], button:has-text("Insertar componente"), input[value*="insertar"]')
-    await page.waitForTimeout(3000)
-
-    // Verificar que no hay error visible en la página
-    const bodyText = await page.textContent('body')
-    if (bodyText.toLowerCase().includes('error') || bodyText.toLowerCase().includes('incorrecto')) {
-      throw new Error('El sistema devolvió un error al insertar el componente')
-    }
-
-    console.log(`✓ Jugador ${solicitud.nombre} ${solicitud.apellido} cargado exitosamente`)
-    return { ok: true }
+    // Buscar mensaje de error específico en la página
+    const errorMatch = postForm.body.match(/class="[^"]*error[^"]*"[^>]*>([^<]{5,200})</i)
+    const errorMsg = errorMatch ? errorMatch[1].trim() : `Respuesta inesperada HTTP ${postForm.status}`
+    throw new Error(errorMsg)
 
   } catch (err) {
-    console.error('Error al cargar jugador en Gesdeportiva:', err.message)
+    console.error(`[GD] ✗ Error: ${err.message}`)
     return { ok: false, error: err.message }
-  } finally {
-    await browser.close()
   }
 }
 
